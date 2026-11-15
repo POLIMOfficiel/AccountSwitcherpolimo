@@ -1,581 +1,300 @@
 /**
-* @name AccountSwitcher
-* @displayName AccountSwitcher
-* @source https://github.com/l0c4lh057/AccountSwitcher/blob/master/AccountSwitcher.plugin.js
-* @patreon https://www.patreon.com/l0c4lh057
-* @authorId 226677096091484160
-* @invite YzzeuJPpyj
-*/
-/**
-@if (@_jscript)
-	
-	// Offer to self-install for clueless users that try to run this directly.
-	var shell = WScript.CreateObject("WScript.Shell");
-	var fs = new ActiveXObject("Scripting.FileSystemObject");
-	var pathPlugins = shell.ExpandEnvironmentStrings("%APPDATA%\BetterDiscord\plugins");
-	var pathSelf = WScript.ScriptFullName;
-	// Put the user at ease by addressing them in the first person
-	shell.Popup("It looks like you've mistakenly tried to run me directly. \n(Don't do that!)", 0, "I'm a plugin for BetterDiscord", 0x30);
-	if (fs.GetParentFolderName(pathSelf) === fs.GetAbsolutePathName(pathPlugins)) {
-		shell.Popup("I'm in the correct folder already.", 0, "I'm already installed", 0x40);
-	} else if (!fs.FolderExists(pathPlugins)) {
-		shell.Popup("I can't find the BetterDiscord plugins folder.\nAre you sure it's even installed?", 0, "Can't install myself", 0x10);
-	} else if (shell.Popup("Should I copy myself to BetterDiscord's plugins folder for you?", 0, "Do you need some help?", 0x34) === 6) {
-		fs.CopyFile(pathSelf, fs.BuildPath(pathPlugins, fs.GetFileName(pathSelf)), true);
-		// Show the user where to put plugins in the future
-		shell.Exec("explorer " + pathPlugins);
-		shell.Popup("I'm installed!", 0, "Successfully installed", 0x40);
+ * @name AccountSwitcher
+ * @displayName AccountSwitcher
+ * @description Switch between saved accounts with a keybind or a menu. Tokens are always stored encrypted with your password.
+ * @version 2.0.0
+ * @author l0c4lh057 (original), POLIMOfficiel (fork)
+ * @source https://github.com/POLIMOfficiel/AccountSwitcherpolimo
+ */
+
+/*
+ * Security notes:
+ * - No network access and no downloaded code: the plugin no longer needs ZeresPluginLibrary or BugReportHelper.
+ * - Tokens are only stored AES-256-GCM encrypted with a key derived (PBKDF2-SHA512) from a password you choose.
+ * - The password is only kept in memory until the plugin is stopped or Discord is restarted.
+ */
+
+module.exports = class AccountSwitcher {
+	constructor(meta) {
+		this.meta = meta;
+		this.name = meta.name || "AccountSwitcher";
+		this.password = null;
+		this.menu = null;
+		this.crypto = require("crypto");
+		this.onKeyDown = this.onKeyDown.bind(this);
+		this.onPointer = this.onPointer.bind(this);
+		this.closeMenu = this.closeMenu.bind(this);
 	}
-	WScript.Quit();
 
-*/
+	// ---------- lifecycle ----------
 
-module.exports = (() => {
-	const config = {
-		info: {
-			name: "AccountSwitcher",
-			authors: [
-				{
-					name: "l0c4lh057",
-					discord_id: "226677096091484160",
-					github_username: "l0c4lh057",
-					twitter_username: "l0c4lh057"
-				}
-			],
-			version: "1.3.5",
-			description: "Simply switch between accounts with the ease of pressing a single key.",
-			github: "https://github.com/l0c4lh057/AccountSwitcher",
-			github_raw: "https://raw.githubusercontent.com/l0c4lh057/AccountSwitcher/master/AccountSwitcher.plugin.js"
-		},
-		changelog: [
-			{
-				title: "Fixed",
-				type: "fixed",
-				items: ["Disabling encryption doesn't crash discord anymore."]
-			},
-			{
-				title: "New",
-				type: "added",
-				items: ["Now Alt+Click opens the switch menu too, not only MB2 click."]
+	start() {
+		this.load();
+		BdApi.DOM.addStyle(this.name, `
+			.accountswitcher-menu { position: fixed; z-index: 10000; display: flex; flex-wrap: wrap; max-width: 360px; padding: 6px; background: #202225; border-radius: 10px; box-shadow: 0 4px 16px rgba(0,0,0,.5); }
+			.accountswitcher-item { position: relative; margin: 6px; width: 64px; height: 64px; cursor: pointer; }
+			.accountswitcher-item img { width: 64px; height: 64px; border-radius: 50%; }
+			.accountswitcher-remove { position: absolute; top: -4px; right: -4px; width: 1.2em; height: 1.2em; line-height: 1.1em; text-align: center; border-radius: 50%; background: #111; border: 2px solid #444; color: #ccc; font-size: 12px; }
+			.accountswitcher-panel { color: var(--text-normal, #dcddde); }
+			.accountswitcher-panel button { margin: 4px 8px 4px 0; padding: 6px 12px; border: none; border-radius: 4px; background: var(--brand-experiment, #5865f2); color: #fff; cursor: pointer; }
+			.accountswitcher-panel input { margin: 4px 0; }
+			.accountswitcher-row { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+		`);
+		document.addEventListener("mouseup", this.onPointer, true);
+		document.addEventListener("click", this.onPointer, true);
+		document.addEventListener("keydown", this.onKeyDown, true);
+	}
+
+	stop() {
+		document.removeEventListener("mouseup", this.onPointer, true);
+		document.removeEventListener("click", this.onPointer, true);
+		document.removeEventListener("keydown", this.onKeyDown, true);
+		this.closeMenu();
+		BdApi.DOM.removeStyle(this.name);
+		this.password = null;
+	}
+
+	// ---------- Discord internals (resolved lazily so Discord updates don't break start()) ----------
+
+	get Webpack() { return BdApi.Webpack; }
+
+	get accountManager() {
+		return this.Webpack.getByKeys("loginToken", { searchExports: true })
+			|| this.Webpack.getModule(m => m && typeof m.loginToken === "function", { searchExports: true });
+	}
+
+	get userStore() {
+		return this.Webpack.getStore?.("UserStore")
+			|| this.Webpack.getByKeys("getCurrentUser", "getUser");
+	}
+
+	get authStore() {
+		return this.Webpack.getStore?.("AuthenticationStore")
+			|| this.Webpack.getModule(m => m && typeof m.getToken === "function" && typeof m.getId === "function");
+	}
+
+	getCurrentUser() {
+		return this.userStore?.getCurrentUser?.();
+	}
+
+	getAvatarUrl(user) {
+		try {
+			const url = user.getAvatarURL?.(null, 128, true);
+			if (url) return url;
+		} catch (e) { /* fall through */ }
+		return user.avatar ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png?size=128` : "https://cdn.discordapp.com/embed/avatars/0.png";
+	}
+
+	// ---------- settings ----------
+
+	load() {
+		const data = BdApi.Data.load(this.name, "settings");
+		const valid = data && data.version === 3 && Array.isArray(data.accounts);
+		if (data && !valid) {
+			// Settings from versions < 2.0.0 used weak or no encryption; they cannot be safely migrated.
+			BdApi.UI.showToast("AccountSwitcher: old saved accounts were removed, please save them again.", { type: "warning" });
+		}
+		this.settings = valid ? data : { version: 3, accounts: [], salt: null, check: null, pluginsToRestart: [] };
+		if (!this.settings.salt) {
+			this.settings.salt = this.crypto.randomBytes(32).toString("base64");
+			this.save();
+		}
+	}
+
+	save() {
+		BdApi.Data.save(this.name, "settings", this.settings);
+	}
+
+	// ---------- crypto ----------
+
+	deriveKey(password) {
+		return this.crypto.pbkdf2Sync(Buffer.from(password, "utf8"), Buffer.from(this.settings.salt, "base64"), 210000, 32, "sha512");
+	}
+
+	encrypt(text, password) {
+		const iv = this.crypto.randomBytes(12);
+		const cipher = this.crypto.createCipheriv("aes-256-gcm", this.deriveKey(password), iv);
+		const enc = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+		return [iv, cipher.getAuthTag(), enc].map(b => b.toString("base64")).join(":");
+	}
+
+	decrypt(payload, password) {
+		const [iv, tag, enc] = payload.split(":").map(p => Buffer.from(p, "base64"));
+		const decipher = this.crypto.createDecipheriv("aes-256-gcm", this.deriveKey(password), iv);
+		decipher.setAuthTag(tag);
+		return Buffer.concat([decipher.update(enc), decipher.final()]).toString("utf8");
+	}
+
+	// Resolves with the password (kept in memory) after asking for it, creating it on first use.
+	async requirePassword() {
+		if (this.password !== null) return this.password;
+		const creating = !this.settings.check;
+		const pw = await this.promptPassword(creating);
+		if (pw === null) throw new Error("cancelled");
+		if (creating) {
+			this.settings.check = this.encrypt("ok", pw);
+			this.save();
+		} else {
+			try {
+				if (this.decrypt(this.settings.check, pw) !== "ok") throw new Error("bad");
+			} catch (e) {
+				BdApi.UI.showToast("Wrong password", { type: "error" });
+				return this.requirePassword();
 			}
-		]
-	};
-	
-	let password = null;
-	const algorithm = "aes-256-cbc";
-	const IV_LENGTH = 16;
-	const Buffer = require("buffer").Buffer;
-	
-	return !global.ZeresPluginLibrary ? class {
-		constructor(){ this._config = config; }
-		getName(){ return config.info.name; }
-		getAuthor(){ return config.info.authors.map(a => a.name).join(", "); }
-		getDescription(){ return config.info.description + " **Install [ZeresPluginLibrary](https://betterdiscord.app/Download?id=9) and restart discord to use this plugin!**"; }
-		getVersion(){ return config.info.version; }
-		load(){
-			BdApi.showConfirmationModal("Library plugin is needed", 
-				[`The library plugin needed for ${config.info.name} is missing. Please click Download Now to install it.`], {
-					confirmText: "Download",
+		}
+		this.password = pw;
+		return pw;
+	}
+
+	promptPassword(creating) {
+		return new Promise(resolve => {
+			let pw = "", pw2 = "", done = false;
+			const finish = v => { if (!done) { done = true; resolve(v); } };
+			const h = BdApi.React.createElement;
+			const input = (placeholder, set) => h("input", { type: "password", placeholder, onChange: e => set(e.target.value), style: { display: "block", margin: "6px 0", width: "100%" } });
+			BdApi.UI.showConfirmationModal(creating ? "Choose a password for your saved accounts" : "Password required",
+				h("div", null, input("Password", v => { pw = v; }), creating ? input("Repeat password", v => { pw2 = v; }) : null),
+				{
+					confirmText: "OK",
 					cancelText: "Cancel",
 					onConfirm: () => {
-						require("request").get("https://rauenzi.github.io/BDPluginLibrary/release/0PluginLibrary.plugin.js", async (error, response, body) => {
-						if (error) return require("electron").shell.openExternal("https://betterdiscord.net/ghdl?url=https://raw.githubusercontent.com/rauenzi/BDPluginLibrary/master/release/0PluginLibrary.plugin.js");
-						await new Promise(r => require("fs").writeFile(require("path").join(BdApi.Plugins.folder, "0PluginLibrary.plugin.js"), body, r));
-						});
-					}
+						if (!pw || (creating && pw !== pw2)) {
+							BdApi.UI.showToast(!pw ? "Password can't be empty" : "Passwords don't match", { type: "error" });
+							return finish(null);
+						}
+						finish(pw);
+					},
+					onCancel: () => finish(null)
 				});
-		}
-		start(){}
-		stop(){}
-	} : (([Plugin, Api]) => {
-		const plugin = (Plugin, Api) => {
-			const { WebpackModules, PluginUtilities, DiscordModules, Settings, Toasts, Modals, DOMTools } = Api;
-			const { React, ReactDOM, UserStore, UserInfoStore } = DiscordModules;
-			const AccountManager = WebpackModules.getByProps("loginToken");
-			const unregisterKeybind = WebpackModules.getByProps("inputEventUnregister").inputEventUnregister.bind(WebpackModules.getByProps("inputEventUnregister"));
-			const registerKeybind = WebpackModules.getByProps("inputEventRegister").inputEventRegister.bind(WebpackModules.getByProps("inputEventUnregister"));
-			const crypto = require("crypto");
-			
-			if(!BdApi.Plugins.get("BugReportHelper") && !BdApi.getData(config.info.name, "didShowIssueHelperPopup")){
-				BdApi.saveData(config.info.name, "didShowIssueHelperPopup", true);
-				BdApi.showConfirmationModal("Do you want to download a helper plugin?", 
-					[`Do you want to download a helper plugin that makes it easier for you to report issues? That plugin is not needed to anything else to function correctly but nice to have when reporting issues, shortening the time until the problem gets resolved by asking you for specific information and also including additional information you did not provide.`],
-					{
-						confirmText: "Download",
-						cancelText: "Cancel",
-						onConfirm: () => {
-							require("request").get("https://raw.githubusercontent.com/l0c4lh057/BetterDiscordStuff/master/Plugins/BugReportHelper/BugReportHelper.plugin.js", (error, response, body) => {
-								if (error) return require("electron").shell.openExternal("https://betterdiscord.net/ghdl?url=https://raw.githubusercontent.com/l0c4lh057/BetterDiscordStuff/master/Plugins/BugReportHelper/BugReportHelper.plugin.js");
-								else require("fs").writeFile(require("path").join(BdApi.Plugins.folder, "BugReportHelper.plugin.js"), body, ()=>{
-									window.setTimeout(()=>BdApi.Plugins.enable("BugReportHelper"), 1000);
-								});
-							});
-						}
-					}
-				);
+		});
+	}
+
+	// ---------- actions ----------
+
+	async saveCurrentAccount() {
+		const user = this.getCurrentUser();
+		const token = this.authStore?.getToken?.();
+		if (!user || !token) return BdApi.UI.showToast("Could not read the current account.", { type: "error" });
+		if (this.settings.accounts.some(a => a.id === user.id)) return BdApi.UI.showToast("You already saved this account", { type: "error" });
+		const pw = await this.requirePassword().catch(() => null);
+		if (pw === null) return;
+		this.settings.accounts.push({ id: user.id, name: user.username, avatar: this.getAvatarUrl(user), token: this.encrypt(token, pw) });
+		this.save();
+		BdApi.UI.showToast(`Saved ${user.username}`, { type: "success" });
+	}
+
+	removeAccount(id) {
+		this.settings.accounts = this.settings.accounts.filter(a => a.id !== id);
+		this.save();
+	}
+
+	async login(account) {
+		if (account.id === this.getCurrentUser()?.id) return BdApi.UI.showToast(`Already using ${account.name}`, { type: "warning" });
+		const manager = this.accountManager;
+		if (!manager) return BdApi.UI.showToast("Login module not found (Discord update?).", { type: "error" });
+		const pw = await this.requirePassword().catch(() => null);
+		if (pw === null) return;
+		let token;
+		try { token = this.decrypt(account.token, pw); } catch (e) { return BdApi.UI.showToast("Could not decrypt this account.", { type: "error" }); }
+		manager.loginToken(token);
+		this.settings.pluginsToRestart.forEach(name => {
+			if (BdApi.Plugins.isEnabled(name)) {
+				BdApi.Plugins.disable(name);
+				setTimeout(() => BdApi.Plugins.enable(name), 5000);
 			}
-			
-			const KeyRecorder = class KeyRecorder extends WebpackModules.getByDisplayName("KeyRecorder") {
-				render() {
-					const ButtonOptions = WebpackModules.getByProps("ButtonLink");
-					const Button = ButtonOptions.default;
-					const ret = super.render();
-					ret.props.children.props.children.props.children.push(
-						React.createElement(
-							DiscordModules.FlexChild,
-							{
-								style: { margin: 0 } 
-							},
-							React.createElement(
-								Button,
-								{
-									className: WebpackModules.getByProps("editIcon", "button").button.split(" ")[1],
-									size: Button.Sizes.MIN,
-									color: ButtonOptions.ButtonColors.GREY,
-									look: ButtonOptions.ButtonLooks.GHOST,
-									onClick: this.props.onRemove
-								},
-								"Remove"
-							)
-						)
-					);
-					return ret;
-				}
-			};
-			const KeybindModule = class KeybindModule extends DiscordModules.Keybind {
-				constructor(props) {
-					super(props);
-				}
-				render() {
-					const ret = super.render();
-					ret.type = KeyRecorder;
-					ret.props.account = this.props.account;
-					ret.props.onRemove = this.props.onRemove;
-					return ret;
-				}
-			};
-			const Keybind = class Keybind extends Settings.SettingField {
-				constructor(account, onChange, onRemove) {
-					super(account.name + " (" + account.id + ")", "", onChange, KeybindModule, {
-						defaultValue: (account.keybind[0] !== -1 && account.keybind.map(a => [0, a])) || [],
-						onChange: element => value => {
-							if (!Array.isArray(value)) return;
-							element.props.value = value;
-							this.onChange(value.map(a => a[1]));
-						},
-						account,
-						onRemove
-					});
-				}
-			};
-			return class AccountSwitcher extends Plugin {
-				updateAvatars(){
-					this.settings.accounts.forEach(acc => {
-						const u = UserStore.getUser(acc.id);
-						if(u) acc.avatar = u.getAvatarURL(null, 128, true);
-					})
-				}
-				
-				onStart(){
-					password = null;
-					this.loadSettings();
-					if(this.settings.salt === undefined){
-						this.settings.salt = crypto.randomBytes(32).toString("base64");
-					}
-					this.settings.accounts.forEach(acc => this.registerKeybind(acc));
-					this.openMenu = this.openMenu.bind(this);
-					PluginUtilities.addStyle("accountswitcher-style", `
-						.accountswitcher-switchmenu {
-							position: fixed;
-							width: auto;
-							height: auto;
-							background-color: #202225;
-							border-radius: 10px;
-							overflow: hidden;
-							z-index: 1000;
-						}
-						.accountswitcher-accountwrapper {
-							position: relative;
-							display: inline-block;
-							margin: 10px;
-							width: 64px;
-							height: 64px;
-						}
-						.accountswitcher-menuavatar {
-							width: 64px;
-							height: 64px;
-						}
-						.accountswitcher-removeaccount {
-							position: absolute;
-							top: -4px;
-							right: -4px;
-							background-color: #111;
-							width: 1em;
-							height: 1em;
-							border-radius: 0.5em;
-							color: #ccc;
-							text-align: center;
-							border: 2px solid #444;
-						}
-						.accountswitcher-settingsbtnwrapper {
-							right: 0;
-							position: absolute;
-						}
-					`);
-					document.addEventListener("mouseup", this.openMenu);
-					document.addEventListener("click", this.openMenu, {capture: true});
-					this.updateAvatars();
-					if(this.settings.encryptionVersion !== 2){
-						if(!this.settings.encrypted){
-							this.settings.accounts.forEach(acc => {
-								acc.token = this.encryptUpdated(this.decryptDeprecated(acc.token, acc.id), acc.id);
-							});
-							this.settings.encryptionVersion = 2;
-							this.saveSettings();
-						}else{
-							this.requirePassword("The encryption algorithm got updated for better security. Please enter your password to decrypt your tokens and encrypt them again with the new algorithm.").then(()=>{
-								this.settings.encTest = this.encryptUpdated("test", password);
-								this.settings.accounts.forEach(acc => {
-									acc.token = this.encryptUpdated(this.encryptUpdated(this.decryptDeprecated(this.decryptDeprecated(acc.token, password), acc.id), acc.id), password);
-								});
-								this.settings.encryptionVersion = 2;
-								this.saveSettings();
-							});
-						}
-					}
-				}
-				
-				onStop(){
-					this.settings.accounts.forEach(acc => this.unregisterKeybind(acc));
-					document.removeEventListener("mouseup", this.openMenu);
-					document.removeEventListener("click", this.openMenu, {capture: true});
-					PluginUtilities.removeStyle("accountswitcher-style");
-				}
-				
-				get defaultSettings(){
-					return {
-						accounts: [],
-						encrypted: false,
-						encTest: "test",
-						pluginsToRestart: ["AccountDetailsPlus", "AutoStartRichPresence"],
-						encryptionVersion: 1
-					}
-				}
-				
-				openMenu(e){
-					if(!(e.type === "mouseup" && e.which === 2) && !(e.type === "click" && e.which === 1 && e.altKey)) return;
-					if(!e.target || !e.target.classList) return;
-					if(!e.target.classList.contains(WebpackModules.getByProps("avatar", "container", "nameTag").avatar.split(" ")[0])) return;
-					e.preventDefault();
-					e.stopPropagation();
-					const menu = document.createElement("div");
-					const AccountPanel = account=>React.createElement(
-						"div",
-						{
-							className: "accountswitcher-accountwrapper"
-						},
-						React.createElement("img", {
-							src: account.avatar,
-							className: "accountswitcher-menuavatar",
-							onClick: e=>this.login(account)
-						}),
-						React.createElement("div", {
-							className: "accountswitcher-removeaccount",
-							onClick: e=>{
-								this.unregisterKeybind(account);
-								this.settings.accounts = this.settings.accounts.filter(acc => acc.id != account.id);
-								this.saveSettings();
-								Toasts.show("Account " + account.name + " removed", {type: Toasts.ToastTypes.success});
-							}
-						}, "⨯")
-					);
-					if(this.settings.accounts.length > 0){
-						const offset = DOMTools.offset(e.target);
-						ReactDOM.render(React.createElement(
-							"div",
-							{
-								className: "accountswitcher-switchmenu",
-								style: {
-									bottom: (offset.bottom - offset.top + 27),
-									left: (offset.left - 5)
-								}
-							},
-							this.settings.accounts.map(account=>React.createElement(AccountPanel, account))
-						), menu);
-						document.body.appendChild(menu);
-					}else{
-						Toasts.show("No accounts to display", {type: Toasts.ToastTypes.warning});
-					}
-					const eventHandler = ev=>{
-						if(!ev.target || !ev.target.classList) return;
-						if(!ev.target.classList.contains("accountswitcher-switchmenu") && !ev.target.classList.contains("accountswitcher-removeaccount")){
-							menu.remove();
-							document.removeEventListener(eventHandler);
-						}
-					};
-					document.addEventListener("click", eventHandler);
-				}
-				
-				login(account){
-					console.log("Logging in as " + account.name);
-					if(account.id == UserStore.getCurrentUser().id) return Toasts.show("Already using account " + account.name, {type: Toasts.ToastTypes.warning});
-					console.log("Logging in as " + account.name);
-					this.requirePassword().then(r => {
-						const token = password == null ? account.token : this.decrypt(account.token, password);
-						AccountManager.loginToken(this.decrypt(token, account.id));
-						window.setTimeout(this.updateAvatars, 5000);
-						this.settings.pluginsToRestart.forEach(pl => {
-							if(BdApi.Plugins.isEnabled(pl)){
-								BdApi.Plugins.disable(pl);
-								window.setTimeout(()=>BdApi.Plugins.enable(pl), 5000);
-							}
-						});
-					});
-				}
-				
-				getSettingsPanel(){
-					const panel = document.createElement("div");
-					panel.className = "form";
-					panel.style = "width:100%;"
-					const accountsField = new Settings.SettingGroup("Accounts", {shown:true});
-					const addAccount = account=>{
-						if(!account){
-							let u = UserStore.getCurrentUser();
-							let t = this.encrypt(UserInfoStore.getToken(), u.id);
-							let acc = {
-								name: u.tag,
-								id: u.id,
-								avatar: u.getAvatarURL(null, 128, true),
-								keybind: [64, 10+this.settings.accounts.length],
-								token: this.settings.encrypted ? this.encrypt(t, password) : t
-							};
-							this.settings.accounts.push(acc);
-							this.saveSettings();
-							this.registerKeybind(acc);
-							return addAccount(acc);
-						}
-						const kbPanel = new Keybind(account, keybind => {
-							this.unregisterKeybind(account);
-							account.keybind = keybind;
-							this.saveSettings();
-							this.registerKeybind(account);
-						}, ()=>{
-							this.unregisterKeybind(account);
-							this.settings.accounts = this.settings.accounts.filter(acc => acc.id != account.id);
-							this.saveSettings();
-							// TODO: remove account from DOM so you are not required to repopen the settings
-							Toasts.show("Account " + account.name + " got removed. After reopening the settings it will also be gone from this list.", {type: Toasts.ToastTypes.success});                        
-						});
-						accountsField.append(kbPanel);
-					};
-					const addAccountButton = document.createElement("button");
-					// TODO: remove hardcoded classes
-					addAccountButton.className = "button-38aScr lookFilled-1Gx00P colorBrand-3pXr91 sizeMedium-1AC_Sl grow-q77ONN";
-					addAccountButton.addEventListener("click", ()=>{
-						if(this.settings.accounts.some(acc => acc.id == UserStore.getCurrentUser().id)){
-							return Toasts.show("You already saved this account", {type: Toasts.ToastTypes.error});
-						}
-						this.requirePassword().then(r => {
-							addAccount();
-						})
-					});
-					addAccountButton.innerText = "Save Account";
-					const logoutButton = document.createElement("button");
-					logoutButton.className = addAccountButton.className;
-					logoutButton.addEventListener("click", ()=>{
-						AccountManager.loginToken("");
-					});
-					logoutButton.innerText = "Log out to add another account";
-					
-					new Settings.SettingGroup(this.getName(), {shown:true}).appendTo(panel)
-							.append(
-								new Settings.Switch("Encrypt tokens", "Encrypting tokens makes sure that nobody will be able to get the tokens without knowing the password.", this.settings.encrypted, checked => {
-									if(checked === this.settings.encrypted) return;
-									if(checked){
-										const retry = ()=>{
-											let pw1 = "";
-											let pw2 = "";
-											Modals.showModal("Set password", React.createElement("div", {},
-												React.createElement("input", {
-													type: "password",
-													placeholder: "Password",
-													onChange: e=>{pw1 = e.target.value;}
-												}),
-												React.createElement("input", {
-													type: "password",
-													placeholder: "Repeat password",
-													onChange: e=>{pw2 = e.target.value;}
-												})
-											), {
-												onConfirm: ()=>{
-													if(pw1 != pw2){
-														Toasts.show("Passwords don't match", {type: Toasts.ToastTypes.error});
-														return retry();
-													}
-													password = pw1;
-													this.settings.encrypted = true;
-													this.settings.encTest = this.encrypt("test", password);
-													this.settings.accounts.forEach(acc => acc.token = this.encrypt(acc.token, password));
-													this.saveSettings();
-												}
-											});
-										}
-										retry();
-									}else{
-										const retry = ()=>{
-											let pw = "";
-											Modals.showModal("Disable encryption", React.createElement("div", {},
-												React.createElement("div", {className: "colorStandard-2KCXvj"}, "Are you sure that you want to disable encryption? To verify please input your current password. You can also choose the 'Forgot Password' option which will remove all saved accounts. To abort just click outside of this popout."),
-												React.createElement("input", {
-													type: "password",
-													placeholder: "Password",
-													onChange: e=>{pw = e.target.value;}
-												})
-											), {
-												onConfirm: ()=>{
-													try {
-														if(this.decrypt(this.settings.encTest, pw) !== "test"){
-															Toasts.show("Passwords incorrect", {type: Toasts.ToastTypes.error});
-															return retry();
-														}
-														this.settings.encrypted = false;
-														this.settings.encTest = "test";
-														this.settings.accounts.forEach(acc => acc.token = this.decrypt(acc.token, pw))
-														password = null;
-														this.saveSettings();
-													}catch(ex){
-														Toasts.show("Passwords incorrect", {type: Toasts.ToastTypes.error});
-														return retry();
-													}
-												},
-												onCancel: ()=>{
-													Modals.showConfirmationModal("Are you sure?", "You are about to disable encryption which will remove all your currently saved accounts without an option to recover them. Only use this if you really forgot your password.", {
-														onConfirm: ()=>{
-															this.settings.encTest = "test";
-															this.settings.encrypted = false;
-															this.settings.accounts = [];
-															password = null;
-															this.saveSettings();
-														}
-													});
-												},
-												confirmText: "Disable encryption",
-												cancelText: "Forgot Password"
-											});
-										};
-										retry();
-									}
-								})
-							)
-							.append(accountsField)
-							.append(addAccountButton)
-							.append(
-								new Settings.Textbox("Plugins to restart", "Put the name of all plugins that should get restarted when you switch accounts in this textbox separated by a comma", this.settings.pluginsToRestart.join(","), val=>{
-									this.settings.pluginsToRestart = val.split(",").map(x=>x.trim()).filter(x=>x);
-									this.saveSettings();
-								})
-							)
-							.append(logoutButton);
-					this.settings.accounts.forEach(acc => addAccount(acc));
-					return panel;
-				}
-				
-				// This function does NOT return the password, it just ensures that the correct password is stored in the "password" variable.
-				// The password should never be exposed so there should be no way to access the password from outside this plugin.
-				async requirePassword(message){
-					if(!this.settings.encrypted || password !== null) return Promise.resolve();
-					return new Promise((resolve, reject) => {
-						const retry = t=>{
-							let pw = "";
-							Modals.showModal("Password required", React.createElement(
-								React.Fragment,
-								!message ? null : message,
-								!message ? null : React.createElement("br"),
-								React.createElement(
-									"input",
-									{
-										type: "password",
-										ref: e=>{if(e)setTimeout(()=>e.focus(),500)},
-										onKeyDown: e=>{if(e.keyCode===13)e.target.parentNode.nextSibling.children[0].click()},
-										onChange: e=>{pw = e.target.value;}
-									}
-								)
-							), {
-								onConfirm: ()=>{
-									try{
-										if(this.decrypt(this.settings.encTest, pw) !== "test"){
-											Toasts.show("Wrong password", {type: Toasts.ToastTypes.error});
-											return retry(t+1);
-										}
-										password = pw;
-										resolve();
-									}catch(ex){
-										Toasts.show("Wrong password", {type: Toasts.ToastTypes.error});
-										retry(t+1);
-									}
-								}
-							})
-						};
-						retry(0);
-					});
-				}
-				
-				encryptDeprecated(text, pw){
-					const key = crypto.createCipher("aes-128-cbc", pw);
-					return key.update(text, "utf8", "hex") + key.final("hex");
-				}
-				decryptDeprecated(text, pw){
-					const key = crypto.createDecipher("aes-128-cbc", pw);
-					return key.update(text, "hex", "utf8") + key.final("utf8");
-				}
-				
-				generateEncryptionKey(pw){
-					return crypto.pbkdf2Sync(Buffer.from(pw, "utf8"), this.settings.salt, 100000, 32, "sha512");
-				}
-				encryptUpdated(text, pw){
-					const iv = crypto.randomBytes(IV_LENGTH);
-					const cipher = crypto.createCipheriv(algorithm, this.generateEncryptionKey(pw), iv);
-					const encrypted = Buffer.concat([cipher.update(text), cipher.final()]);
-					return iv.toString("base64") + ":" + encrypted.toString("base64");
-				}
-				decryptUpdated(text, pw){
-					const parts = text.split(":");
-					const iv = Buffer.from(parts.shift(), "base64");
-					const encrypted = Buffer.from(parts.join(":"), "base64");
-					const decipher = crypto.createDecipheriv(algorithm, this.generateEncryptionKey(pw), iv);
-					const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-					return decrypted.toString();
-				}
-				
-				encrypt(text, pw){
-					return this.settings.encryptionVersion === 2 ? this.encryptUpdated(text, pw) : this.encryptDeprecated(text, pw);
-				}
-				decrypt(text, pw){
-					return this.settings.encryptionVersion === 2 ? this.decryptUpdated(text, pw) : this.decryptDeprecated(text, pw);
-				}
-				
-				registerKeybind(account){
-					registerKeybind("119" + account.id, account.keybind.map(a=>[0,a]), pressed => {
-						this.login(account);
-					}, {blurred: false, focused: true, keydown: true, keyup: false});
-				}
-				unregisterKeybind(account){
-					unregisterKeybind("119" + account.id);
-				}
-				
-				loadSettings(){
-					this.settings = PluginUtilities.loadSettings(this.getName(), this.defaultSettings);
-					if(!Array.isArray(this.settings.accounts)) this.settings.accounts = Object.values(this.settings.accounts);
-					this.settings.accounts.forEach(acc => {
-						if(!Array.isArray(acc.keybind)) acc.keybind = Object.values(acc.keybind);
-					});
-				}
-				saveSettings(){
-					PluginUtilities.saveSettings(this.getName(), this.settings);
-				}
-			}
+		});
+	}
+
+	// ---------- UI ----------
+
+	onKeyDown(e) {
+		if (!e.altKey || e.ctrlKey || e.metaKey || e.shiftKey || !/^Digit[0-9]$/.test(e.code)) return;
+		const n = e.code === "Digit0" ? 9 : Number(e.code.slice(5)) - 1;
+		const account = this.settings.accounts[n];
+		if (!account) return;
+		e.preventDefault();
+		this.login(account);
+	}
+
+	onPointer(e) {
+		if (!((e.type === "mouseup" && e.button === 1) || (e.type === "click" && e.button === 0 && e.altKey))) return;
+		const avatar = e.target?.closest?.('[class*="panels"] [class*="avatar"]');
+		if (!avatar) return;
+		e.preventDefault();
+		e.stopPropagation();
+		this.openMenu(avatar.getBoundingClientRect());
+	}
+
+	openMenu(rect) {
+		this.closeMenu();
+		if (!this.settings.accounts.length) return BdApi.UI.showToast("No accounts to display", { type: "warning" });
+		const menu = document.createElement("div");
+		menu.className = "accountswitcher-menu";
+		menu.style.left = `${Math.max(rect.left - 5, 5)}px`;
+		menu.style.bottom = `${window.innerHeight - rect.top + 8}px`;
+		this.settings.accounts.forEach(account => {
+			const item = document.createElement("div");
+			item.className = "accountswitcher-item";
+			item.title = account.name;
+			const img = document.createElement("img");
+			img.src = account.avatar;
+			img.addEventListener("click", () => { this.closeMenu(); this.login(account); });
+			const rm = document.createElement("div");
+			rm.className = "accountswitcher-remove";
+			rm.textContent = "\u00d7";
+			rm.addEventListener("click", () => { this.removeAccount(account.id); item.remove(); });
+			item.append(img, rm);
+			menu.append(item);
+		});
+		document.body.append(menu);
+		this.menu = menu;
+		setTimeout(() => document.addEventListener("mousedown", this.closeMenu, true), 0);
+	}
+
+	closeMenu(e) {
+		if (e && this.menu && this.menu.contains(e.target)) return;
+		document.removeEventListener("mousedown", this.closeMenu, true);
+		this.menu?.remove();
+		this.menu = null;
+	}
+
+	getSettingsPanel() {
+		const panel = document.createElement("div");
+		panel.className = "accountswitcher-panel";
+		const render = () => {
+			panel.replaceChildren();
+			const info = document.createElement("p");
+			info.textContent = "Alt+1\u2026Alt+9 / Alt+0 switch to the matching account. Alt+click or middle-click your avatar to open the menu. Tokens are encrypted with your password.";
+			panel.append(info);
+			this.settings.accounts.forEach((account, i) => {
+				const row = document.createElement("div");
+				row.className = "accountswitcher-row";
+				const label = document.createElement("span");
+				label.textContent = `Alt+${(i + 1) % 10}: ${account.name} (${account.id})`;
+				const del = document.createElement("button");
+				del.textContent = "Remove";
+				del.addEventListener("click", () => { this.removeAccount(account.id); render(); });
+				row.append(label, del);
+				panel.append(row);
+			});
+			const save = document.createElement("button");
+			save.textContent = "Save current account";
+			save.addEventListener("click", async () => { await this.saveCurrentAccount(); render(); });
+			const logout = document.createElement("button");
+			logout.textContent = "Log out to add another account";
+			logout.addEventListener("click", () => this.accountManager?.loginToken(""));
+			panel.append(save, logout);
+			const restartLabel = document.createElement("div");
+			restartLabel.textContent = "Plugins to restart when switching (comma separated):";
+			const restart = document.createElement("input");
+			restart.value = this.settings.pluginsToRestart.join(",");
+			restart.addEventListener("change", () => {
+				this.settings.pluginsToRestart = restart.value.split(",").map(x => x.trim()).filter(Boolean);
+				this.save();
+			});
+			panel.append(restartLabel, restart);
 		};
-		return plugin(Plugin, Api);
-	})(global.ZeresPluginLibrary.buildPlugin(config));
-})();
-/*@end*/
+		render();
+		return panel;
+	}
+};
